@@ -1,14 +1,16 @@
 """OR-Tools 频率位置规划（离线简化模型）。
 
-为给定的一组载波寻找一组满足最小间隔约束的中心频率位置：
+为给定的一组载波寻找一组满足最小间隔与受保护接收机约束的中心频率位置：
 
 - 频率离散到 1 kHz 网格，用 CP-SAT 求解整数模型。
 - 同极化、或复用规则为 forbidden/unknown 的极化对：两个频带不得相交，
-  且边缘净距不小于要求值；用 AddCircuit 实现“i 在 j 左”或“j 在 i 左”的析取。
+  且边缘净距不小于要求值；用析取约束实现“i 在 j 左”或“j 在 i 左”。
 - 复用规则为 allowed（已知隔离度足够）的极化对：允许同频，不加间隔约束。
 - guard_only 模式：统一使用规则中的保护间隔。
-- mask_aware 模式：每对载波的间隔按双方掩模尾部泄漏都不越限来反算
-  （功率/掩模不同 => 两个方向阈值不同）。
+- mask_aware 模式：每对载波的间隔按双方掩模尾部泄漏都不越限来反算。
+- 受保护接收窗：逐载波计算方向性泄漏；多个适用载波共享线性功率预算。
+  若异极化隔离未知，规划器保守地把所有相关载波放到掩模跨度之外（零泄漏），
+  避免规划后复核停留在“待评估”。
 
 目标：最小化各载波相对其偏好位置（录入中心频率，截断到可用频段内）的偏移量。
 
@@ -19,13 +21,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.integrate import trapezoid as scipy_trapezoid
 
-from .analysis import Carrier, AnalysisRules
+from .analysis import (AnalysisRules, Carrier, ProtectedReceiver,
+                       leakage_to_window_dbm)
 from .masks import get_mask
 from .units import dbm_to_watt, watt_to_dbm
 
 GRID_KHZ = 1  # 频率规划网格：1 kHz
-# 泄漏评估网格 (MHz)：必须与分析模块 leakage_power_dbm 的默认网格一致，
+# 泄漏评估网格 (MHz)：必须与分析模块泄漏积分的默认网格一致，
 # 否则规划求得的“达标净距”在分析口径下可能因数值错位而差之毫厘。
 EVAL_GRID_MHZ = 0.01
 # 规划裕量 (dB)：泄漏限值在规划口径上收紧 0.5 dB，
@@ -52,7 +56,7 @@ def _leakage_at_separation(tx: Carrier, victim_bw_mhz: float,
     inside = (f >= v_low - 1e-12) & (f <= v_high + 1e-12)
     if not np.any(inside):
         return float("-inf")
-    p_w = float(np.trapezoid(dbm_to_watt(psd[inside]), dx=grid_step_mhz * 1e6))
+    p_w = float(scipy_trapezoid(dbm_to_watt(psd[inside]), dx=grid_step_mhz * 1e6))
     return watt_to_dbm(p_w)
 
 
@@ -65,7 +69,7 @@ def _required_gap_one_direction(tx: Carrier, victim: Carrier,
     g 达到 mask 跨度 - victim 半宽后两频带不再相交，泄漏为 -inf，必然达标。
     """
     limit = rules.leakage_limit_dbm - PLAN_MARGIN_DB
-    max_gap = get_mask(tx.mask_name).span_mhz - victim.bandwidth_mhz / 2.0
+    max_gap = get_mask(tx.mask_name).span_mhz - tx.bandwidth_mhz / 2.0
     n_steps = int(max_gap / grid_step_mhz) + 1
     for k in range(n_steps + 1):
         g = k * grid_step_mhz
@@ -88,6 +92,35 @@ def _safe_edge_gap(a: Carrier, b: Carrier, rules: AnalysisRules) -> float:
     return float(np.ceil(g / EVAL_GRID_MHZ + 1e-9) * EVAL_GRID_MHZ)
 
 
+def _required_window_gap(tx: Carrier, rx: ProtectedReceiver, limit_dbm: float,
+                         require_zero: bool) -> tuple[float | None, str]:
+    """载波与保护窗之间所需边缘净距。
+
+    返回 None 表示无需空间约束（载波全部功率也不超过其线性功率预算）。
+    require_zero=True 时寻找泄漏为零的净距，用于未知极化隔离场景。
+    掩模关于中心对称，只需用“载波在窗左侧”的距离扫描即可得到两侧净距。
+    """
+    if not require_zero and tx.power_dbm <= limit_dbm:
+        return None, "power_within_budget"
+
+    window_bw = rx.window_high_mhz - rx.window_low_mhz
+    max_gap = get_mask(tx.mask_name).span_mhz - tx.bandwidth_mhz / 2.0
+    n_steps = int(max_gap / EVAL_GRID_MHZ) + 1
+    for k in range(n_steps + 1):
+        g = k * EVAL_GRID_MHZ
+        # 虚拟受害频带位于载波右侧，左边缘与载波右边缘净距为 g。
+        virtual_center = tx.center_mhz + g + (tx.bandwidth_mhz + window_bw) / 2.0
+        virtual_low = virtual_center - window_bw / 2.0
+        virtual_high = virtual_center + window_bw / 2.0
+        leak = leakage_to_window_dbm(tx, virtual_low, virtual_high)
+        if require_zero:
+            if not np.isfinite(leak):
+                return float(np.ceil(g / EVAL_GRID_MHZ + 1e-9) * EVAL_GRID_MHZ), "zero_leakage_unknown_isolation"
+        elif leak <= limit_dbm:
+            return float(np.ceil(g / EVAL_GRID_MHZ + 1e-9) * EVAL_GRID_MHZ), "aggregate_power_budget"
+    return float(np.ceil(max_gap / EVAL_GRID_MHZ + 1e-9) * EVAL_GRID_MHZ), "zero_leakage"
+
+
 def plan(carriers: list[Carrier], rules: AnalysisRules,
          band: BandLimits, mode: str = "guard_only") -> dict:
     """用 CP-SAT 求一组可行频率位置。"""
@@ -100,7 +133,7 @@ def plan(carriers: list[Carrier], rules: AnalysisRules,
     def khz(mhz: float) -> int:
         return int(round(mhz * 1000.0 / GRID_KHZ))
 
-    halfbw = [khz(c.bandwidth_mhz / 2.0) for c in carriers]
+    halfbw = [khz(c.bandwidth_mhz / 2) for c in carriers]
     lo = khz(band.low_mhz)
     hi = khz(band.high_mhz)
 
@@ -148,6 +181,62 @@ def plan(carriers: list[Carrier], rules: AnalysisRules,
                 "reuse_policy": policy,
             })
 
+    receiver_info: list[dict] = []
+    for rx_idx, rx in enumerate(rules.protected_receivers or []):
+        applicable_idx = [i for i, c in enumerate(carriers)
+                          if c.polarization in rx.polarizations]
+        if not applicable_idx:
+            continue
+        # 等功率预算是与具体位置无关的保守上界：即使 N 个载波同时靠近，
+        # 每个不超过 limit/N，线性总和也不越限。
+        budget_dbm = rx.power_limit_dbm - 10.0 * np.log10(len(applicable_idx))
+        active_pols = {carriers[i].polarization for i in applicable_idx}
+        unknown_isolation = False
+        if len(active_pols) >= 2:
+            pols = sorted(active_pols)
+            for pa, pb in ((pols[a], pols[b])
+                           for a in range(len(pols)) for b in range(a + 1, len(pols))):
+                if rules.policy_for(pa, pb) == "unknown":
+                    unknown_isolation = True
+
+        rx_lo = khz(rx.window_low_mhz)
+        rx_hi = khz(rx.window_high_mhz)
+        constrained = 0
+        for i in applicable_idx:
+            tx = carriers[i]
+            req_mhz, reason = _required_window_gap(
+                tx, rx, budget_dbm - PLAN_MARGIN_DB, unknown_isolation)
+            if req_mhz is None:
+                receiver_info.append({
+                    "receiver_key": rx.receiver_key, "version": rx.version,
+                    "receiver_name": rx.name, "carrier": tx.name,
+                    "required_edge_mhz": 0.0, "constraint": reason,
+                    "aggregate_budget_dbm": round(budget_dbm, 3),
+                })
+                continue
+            req = khz(req_mhz)
+            left = model.new_bool_var(f"c{i}_left_of_rx_{rx_idx}")
+            right = model.new_bool_var(f"c{i}_right_of_rx_{rx_idx}")
+            model.add(x[i] + halfbw[i] + req <= rx_lo).only_enforce_if(left)
+            model.add(rx_hi + req <= x[i] - halfbw[i]).only_enforce_if(right)
+            model.add_bool_or(left, right)
+            constrained += 1
+            receiver_info.append({
+                "receiver_key": rx.receiver_key, "version": rx.version,
+                "receiver_name": rx.name, "carrier": tx.name,
+                "required_edge_mhz": round(req_mhz, 4), "constraint": reason,
+                "aggregate_budget_dbm": round(budget_dbm, 3),
+                "unknown_isolation": unknown_isolation,
+            })
+        receiver_info.append({
+            "receiver_key": rx.receiver_key, "version": rx.version,
+            "receiver_name": rx.name, "constraint": "window summary",
+            "applicable_carrier_count": len(applicable_idx),
+            "constrained_carrier_count": constrained,
+            "aggregate_budget_dbm": round(budget_dbm, 3),
+            "unknown_isolation": unknown_isolation,
+        })
+
     model.minimize(sum(deviation.values()))
 
     solver = cp_model.CpSolver()
@@ -159,9 +248,11 @@ def plan(carriers: list[Carrier], rules: AnalysisRules,
         return {
             "feasible": False,
             "status": solver.status_name(status),
-            "message": "在给定频段与间隔约束下找不到可行方案，可放宽保护间隔、扩大频段或允许极化复用。",
+            "message": "在给定频段、间隔与受保护接收机约束下找不到可行方案，"
+                       "可放宽保护间隔、扩大频段、允许极化复用或调整保护窗。",
             "assignments": [],
             "pair_constraints": pair_info,
+            "receiver_constraints": receiver_info,
             "mode": mode,
         }
 
@@ -189,6 +280,7 @@ def plan(carriers: list[Carrier], rules: AnalysisRules,
         "objective_khz": solver.objective_value * GRID_KHZ,
         "assignments": assignments,
         "pair_constraints": pair_info,
+        "receiver_constraints": receiver_info,
         "occupied_span_mhz": round(max(h for _, h in used) - min(l for l, _ in used), 4),
         "band_limits_mhz": [band.low_mhz, band.high_mhz],
         "message": f"已找到可行频率位置（共 {n} 个载波，目标偏移 "

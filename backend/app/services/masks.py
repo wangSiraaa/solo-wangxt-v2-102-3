@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Sequence
-
 import numpy as np
 from scipy.interpolate import interp1d
 
@@ -66,7 +64,6 @@ def spectrum_curve(mask: Mask, center_mhz: float, bandwidth_mhz: float,
     带内 (|offset| <= BW/2) 平坦：psd = P_dbm - 10log10(带宽Hz)；
     带外按掩模衰减；超过掩模跨度截断。
     """
-    half_bw = bandwidth_mhz / 2.0
     span = mask.span_mhz
     f = np.arange(center_mhz - span, center_mhz + span + grid_step_mhz / 2, grid_step_mhz)
     psd = psd_on_grid(mask, f, center_mhz, bandwidth_mhz, power_dbm)

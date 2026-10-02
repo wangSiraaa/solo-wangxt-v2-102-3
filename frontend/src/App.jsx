@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api.js'
 import CarrierTable from './components/CarrierTable.jsx'
 import RulesPanel, { policyKey } from './components/RulesPanel.jsx'
@@ -7,6 +7,10 @@ import PowerSummary from './components/PowerSummary.jsx'
 import BandChart from './components/BandChart.jsx'
 import SpectrumChart from './components/SpectrumChart.jsx'
 import MaskPreview from './components/MaskPreview.jsx'
+import ProtectedReceiversPanel from './components/ProtectedReceiversPanel.jsx'
+import ProtectedReceiverChecks from './components/ProtectedReceiverChecks.jsx'
+import RuleFreshnessBanner from './components/RuleFreshnessBanner.jsx'
+import ScenarioHistory from './components/ScenarioHistory.jsx'
 
 const EMPTY_RULES = { guard_required_mhz: 1.0, leakage_limit_dbm: -45.0, reuse_policy: {} }
 
@@ -19,43 +23,89 @@ export default function App() {
   const [masks, setMasks] = useState([])
   const [carriers, setCarriers] = useState([newCarrier(0)])
   const [rules, setRules] = useState(EMPTY_RULES)
+  const [receivers, setReceivers] = useState([])
+  const [selectedReceiverKeys, setSelectedReceiverKeys] = useState([])
+  const [missingReceiverKeys, setMissingReceiverKeys] = useState([])
   const [band, setBand] = useState({ low: 80, high: 220 })
   const [scenarios, setScenarios] = useState([])
   const [scenarioId, setScenarioId] = useState(null)
   const [scenarioName, setScenarioName] = useState('未命名场景')
   const [analysis, setAnalysis] = useState(null)
   const [plan, setPlan] = useState(null)
+  const [analysisHistory, setAnalysisHistory] = useState([])
+  const [planHistory, setPlanHistory] = useState([])
   const [planMode, setPlanMode] = useState('guard_only')
   const [planView, setPlanView] = useState(false)
   const [tab, setTab] = useState('spectrum')
   const [selectedPair, setSelectedPair] = useState(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
+  const analysisRef = useRef(null)
+  const planRef = useRef(null)
 
   useEffect(() => {
     api.masks().then(setMasks).catch((e) => setError(String(e)))
+    refreshReceivers()
     refreshScenarios()
   }, [])
 
   const refreshScenarios = () =>
     api.listScenarios().then(setScenarios).catch(() => {})
+  const refreshReceivers = () =>
+    api.listReceivers().then(setReceivers).catch(() => {})
+  const refreshHistory = (sid) => {
+    if (!sid) {
+      setAnalysisHistory([]); setPlanHistory([])
+      return
+    }
+    api.listScenarioAnalyses(sid).then(setAnalysisHistory).catch(() => {})
+    api.listScenarioPlans(sid).then(setPlanHistory).catch(() => {})
+  }
+  const refreshStoredResults = useCallback(async () => {
+    if (analysisRef.current?.id) {
+      api.getAnalysis(analysisRef.current.id).then((v) => {
+        analysisRef.current = v
+        setAnalysis(v)
+      }).catch(() => {})
+    }
+    if (planRef.current?.id) {
+      api.getPlan(planRef.current.id).then((v) => {
+        planRef.current = v
+        setPlan(v)
+      }).catch(() => {})
+    }
+  }, [])
+
+  const updateAnalysis = (v) => { analysisRef.current = v; setAnalysis(v) }
+  const updatePlan = (v) => { planRef.current = v; setPlan(v) }
+  const openStoredAnalysis = async (id) => {
+    const stored = await api.getAnalysis(id)
+    updatePlan(null); updateAnalysis(stored); setPlanView(false); setTab('spectrum')
+  }
+  const openStoredPlan = async (id) => {
+    const stored = await api.getPlan(id)
+    updatePlan(stored); setPlanView(true); setTab('spectrum')
+  }
 
   const runAnalyze = useCallback(async () => {
-    setBusy('analyze'); setError(''); setPlan(null)
+    setBusy('analyze'); setError(''); updatePlan(null)
     try {
       const res = await api.analyze({
         carriers,
         rules: { ...rules, reuse_policy: normalizePolicy(rules.reuse_policy) },
+        protected_receiver_keys: selectedReceiverKeys,
+        scenario_id: scenarioId,
         plot_grid_mhz: 0.05,
       })
-      setAnalysis(res)
+      updateAnalysis(res)
+      if (scenarioId) refreshHistory(scenarioId)
       setTab('spectrum')
     } catch (e) {
       setError(e.message)
     } finally {
       setBusy('')
     }
-  }, [carriers, rules])
+  }, [carriers, rules, selectedReceiverKeys, scenarioId])
 
   const runPlan = useCallback(async () => {
     setBusy('plan'); setError('')
@@ -63,19 +113,30 @@ export default function App() {
       const res = await api.plan({
         carriers,
         rules: { ...rules, reuse_policy: normalizePolicy(rules.reuse_policy) },
+        protected_receiver_keys: selectedReceiverKeys,
+        scenario_id: scenarioId,
         band_low_mhz: band.low, band_high_mhz: band.high, mode: planMode,
       })
-      setPlan(res)
+      updatePlan(res)
+      if (scenarioId) refreshHistory(scenarioId)
       setPlanView(false) // 默认显示原始（冲突）谱；可切换到规划后
     } catch (e) {
       setError(e.message)
     } finally {
       setBusy('')
     }
-  }, [carriers, rules, band, planMode])
+  }, [carriers, rules, selectedReceiverKeys, scenarioId, band, planMode])
 
   const loadScenario = async (id) => {
-    if (!id) { setScenarioId(null); return }
+    if (!id) {
+      setScenarioId(null)
+      setScenarioName('未命名场景')
+      setSelectedReceiverKeys([])
+      setMissingReceiverKeys([])
+      updateAnalysis(null); updatePlan(null); setSelectedPair(null)
+      refreshHistory(null)
+      return
+    }
     setBusy('load'); setError('')
     try {
       const sc = await api.getScenario(id)
@@ -83,8 +144,11 @@ export default function App() {
       setCarriers(sc.carriers.map(({ id, ...c }) => c))
       setRules({ guard_required_mhz: sc.guard_required_mhz,
                  leakage_limit_dbm: sc.leakage_limit_dbm, reuse_policy: sc.reuse_policy || {} })
+      setSelectedReceiverKeys(sc.protected_receiver_keys || [])
+      setMissingReceiverKeys(sc.missing_protected_receiver_keys || [])
       setBand({ low: sc.band_low_mhz, high: sc.band_high_mhz })
-      setAnalysis(null); setPlan(null); setSelectedPair(null)
+      updateAnalysis(null); updatePlan(null); setSelectedPair(null)
+      refreshHistory(sc.id)
     } catch (e) { setError(e.message) } finally { setBusy('') }
   }
 
@@ -93,7 +157,9 @@ export default function App() {
     const payload = {
       name: scenarioName, description: '', band_low_mhz: band.low, band_high_mhz: band.high,
       guard_required_mhz: rules.guard_required_mhz, leakage_limit_dbm: rules.leakage_limit_dbm,
-      reuse_policy: normalizePolicy(rules.reuse_policy), carriers,
+      reuse_policy: normalizePolicy(rules.reuse_policy),
+      protected_receiver_keys: selectedReceiverKeys,
+      carriers,
     }
     try {
       const saved = scenarioId
@@ -115,8 +181,6 @@ export default function App() {
   }
 
   const status = analysis?.status
-  // 频段图始终显示录入频带（按原始冲突着色），规划位置以绿色描边框叠加
-  const shownBands = analysis?.bands
   const shownFindings = analysis?.findings || []
   const plannedSpectrum = plan?.feasible ? plan.spectrum : null
   const plannedBands = plan?.feasible ? plan.bands : null
@@ -125,6 +189,13 @@ export default function App() {
   const shownFindingsList = planView ? plan?.post_check?.findings : shownFindings
   const shownPower = planView ? plan?.post_check?.power_summary : analysis?.power_summary
   const shownStatus = planView ? plan?.post_check?.status : status
+  const shownProtectedWindows = planView
+    ? (plan?.protected_windows || [])
+    : (analysis?.protected_windows || [])
+  const shownProtectedChecks = planView
+    ? (plan?.post_check?.protected_receiver_checks || [])
+    : (analysis?.protected_receiver_checks || [])
+  const shownFreshness = planView ? plan?.rule_freshness : analysis?.rule_freshness
 
   return (
     <>
@@ -162,6 +233,13 @@ export default function App() {
           </div>
 
           <div className="panel">
+            <h2>历史分析 / 规划（保留规则版本）</h2>
+            <ScenarioHistory analyses={analysisHistory} plans={planHistory}
+                             onOpenAnalysis={openStoredAnalysis}
+                             onOpenPlan={openStoredPlan} />
+          </div>
+
+          <div className="panel">
             <h2>载波录入</h2>
             <CarrierTable carriers={carriers} masks={masks} onChange={setCarriers}
                           onAdd={() => setCarriers([...carriers, newCarrier(carriers.length)])}
@@ -172,6 +250,33 @@ export default function App() {
           <div className="panel">
             <h2>规则与极化复用</h2>
             <RulesPanel rules={rules} onChange={setRules} disabled={!!busy} />
+          </div>
+
+          <div className="panel">
+            <h2>受保护接收机</h2>
+            {missingReceiverKeys.length > 0 && (
+              <div className="freshness stale" style={{ marginBottom: 8 }}>
+                场景绑定的规则已删除或无当前版本：{missingReceiverKeys.join(', ')}；
+                <button type="button" onClick={() => {
+                  setSelectedReceiverKeys((keys) => keys.filter((k) => !missingReceiverKeys.includes(k)))
+                  setMissingReceiverKeys([])
+                }}>移除这些绑定</button>
+                历史报告仍保留原版本。
+              </div>
+            )}
+            <ProtectedReceiversPanel
+              receivers={receivers}
+              selectedKeys={selectedReceiverKeys}
+              onToggle={(key) => setSelectedReceiverKeys(
+                selectedReceiverKeys.includes(key)
+                  ? selectedReceiverKeys.filter((k) => k !== key)
+                  : [...selectedReceiverKeys, key])}
+              onRefresh={async () => {
+                await refreshReceivers()
+                refreshStoredResults()
+                if (scenarioId) refreshHistory(scenarioId)
+              }}
+              disabled={!!busy} />
           </div>
 
           <div className="panel">
@@ -187,6 +292,7 @@ export default function App() {
 
         {/* 右列：结果 */}
         <div>
+          <RuleFreshnessBanner freshness={shownFreshness} />
           <div className="panel">
             <div className="tabs">
               <button className={tab === 'spectrum' ? 'on' : ''} onClick={() => setTab('spectrum')}>频段与发射谱</button>
@@ -195,7 +301,10 @@ export default function App() {
 
             {tab === 'spectrum' && (
               <>
-                <BandChart bands={shownBands} findings={shownFindings} plan={plan}
+                <BandChart bands={spectrumBands} findings={shownFindingsList}
+                           plan={planView ? null : plan}
+                           protectedWindows={shownProtectedWindows}
+                           protectedChecks={shownProtectedChecks}
                            selectedPair={selectedPair}
                            onPick={(name) => setSelectedPair(
                              selectedPair && selectedPair.includes(name) && selectedPair.length === 2
@@ -215,13 +324,20 @@ export default function App() {
                     </span>
                   )}
                 </div>
-                <SpectrumChart spectrum={shownSpectrum} bands={spectrumBands} />
+                <SpectrumChart spectrum={shownSpectrum} bands={spectrumBands}
+                               protectedWindows={shownProtectedWindows} />
                 <div className="plot-note">
                   提示：点击上方频段条选择载波；点击下方冲突条目可高亮对应载波对。
                 </div>
               </>
             )}
             {tab === 'masks' && <MaskPreview masks={masks} />}
+          </div>
+
+          <div className="panel">
+            <h2>受保护接收机复核{planView ? '（规划后）' : ''}</h2>
+            <ProtectedReceiverChecks checks={shownProtectedChecks}
+                                     windows={shownProtectedWindows} />
           </div>
 
           <div className="panel">
@@ -290,24 +406,46 @@ function PlanResult({ plan }) {
         <button onClick={() => setOpen(!open)}>{open ? '收起' : '展开'}</button>
       </div>
       {open && (
-        <table className="plan-table" style={{ marginTop: 8 }}>
-          <thead>
-            <tr><th>载波</th><th>原中心</th><th>新中心 MHz</th><th>频带范围</th><th>偏移 MHz</th></tr>
-          </thead>
-          <tbody>
-            {plan.assignments.map((a) => (
-              <tr key={a.name}>
-                <td>{a.name} <span className="muted">{a.polarization}</span></td>
-                <td>{a.original_center_mhz.toFixed(3)}</td>
-                <td>{a.center_mhz.toFixed(3)}</td>
-                <td>{a.low_mhz.toFixed(2)}–{a.high_mhz.toFixed(2)}</td>
-                <td className={a.shift_mhz > 0 ? 'shift-pos' : a.shift_mhz < 0 ? 'shift-neg' : ''}>
-                  {a.shift_mhz > 0 ? '+' : ''}{a.shift_mhz.toFixed(3)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <>
+          <table className="plan-table" style={{ marginTop: 8 }}>
+            <thead>
+              <tr><th>载波</th><th>原中心</th><th>新中心 MHz</th><th>频带范围</th><th>偏移 MHz</th></tr>
+            </thead>
+            <tbody>
+              {plan.assignments.map((a) => (
+                <tr key={a.name}>
+                  <td>{a.name} <span className="muted">{a.polarization}</span></td>
+                  <td>{a.original_center_mhz.toFixed(3)}</td>
+                  <td>{a.center_mhz.toFixed(3)}</td>
+                  <td>{a.low_mhz.toFixed(2)}–{a.high_mhz.toFixed(2)}</td>
+                  <td className={a.shift_mhz > 0 ? 'shift-pos' : a.shift_mhz < 0 ? 'shift-neg' : ''}>
+                    {a.shift_mhz > 0 ? '+' : ''}{a.shift_mhz.toFixed(3)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {plan.receiver_constraints?.length > 0 && (
+            <details className="rx-plan-details">
+              <summary>受保护接收机约束（{plan.receiver_constraints.length}）</summary>
+              <table className="plan-table">
+                <thead>
+                  <tr><th>接收机</th><th>载波</th><th>所需净距 MHz</th><th>约束依据</th></tr>
+                </thead>
+                <tbody>
+                  {plan.receiver_constraints.filter((r) => r.carrier).map((r, i) => (
+                    <tr key={`${r.receiver_key}-${r.carrier}-${i}`}>
+                      <td>{r.receiver_name} v{r.version}</td>
+                      <td>{r.carrier}</td>
+                      <td>{r.required_edge_mhz}</td>
+                      <td>{r.constraint}{r.unknown_isolation ? ' · 未知隔离按零泄漏' : ''}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </details>
+          )}
+        </>
       )}
     </div>
   )

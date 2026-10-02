@@ -1,5 +1,5 @@
 """OR-Tools 规划器测试。"""
-from app.services.analysis import AnalysisRules, Carrier, analyze, leakage_power_dbm
+from app.services.analysis import AnalysisRules, Carrier, analyze
 from app.services.planner import BandLimits, plan
 
 C = lambda **kw: Carrier(id=None, **kw)

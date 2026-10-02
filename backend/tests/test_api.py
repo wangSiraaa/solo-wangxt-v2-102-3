@@ -1,38 +1,4 @@
-"""API 集成测试：用内存 SQLite 覆盖 PostgreSQL engine，不依赖外部服务。"""
-import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
-
-from app import main
-from app.db import Base, CarrierRow, MaskRow, Scenario
-from app.seed import DEMO_CARRIERS, DEMO_POLICY
-from app.services.masks import MASKS
-
-
-@pytest.fixture()
-def client(monkeypatch):
-    engine = create_engine(
-        "sqlite+pysqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    Base.metadata.create_all(engine)
-    with Session(engine) as s:
-        for m in MASKS.values():
-            s.add(MaskRow(name=m.name, points=[list(p) for p in m.points],
-                          span_mhz=m.span_mhz, description=m.description))
-        sc = Scenario(name="教学演示场景", description="t", band_low_mhz=80,
-                      band_high_mhz=220, guard_required_mhz=1.0,
-                      leakage_limit_dbm=-45.0, reuse_policy=DEMO_POLICY,
-                      carriers=[CarrierRow(**kw) for kw in DEMO_CARRIERS])
-        s.add(sc)
-        s.commit()
-    monkeypatch.setattr(main, "engine", engine)
-    with TestClient(main.app) as c:
-        yield c
-
+"""核心 API 集成测试；共享 client fixture 位于 conftest.py。"""
 
 def test_health(client):
     assert client.get("/api/health").json()["status"] == "ok"
@@ -48,6 +14,7 @@ def test_analyze_demo_locates_every_conflict_pair(client):
     body = {"carriers": sc["carriers"],
             "rules": {"guard_required_mhz": 1.0, "leakage_limit_dbm": -45.0,
                       "reuse_policy": sc["reuse_policy"]},
+            "protected_receiver_keys": [],
             "plot_grid_mhz": 0.05}
     res = client.post("/api/analyze", json=body).json()
 
@@ -95,6 +62,24 @@ def test_scenario_crud(client):
     assert client.get(f"/api/scenarios/{sid}").json()["carriers"][0]["name"] == "A"
     assert client.delete(f"/api/scenarios/{sid}").json()["deleted"] == sid
     assert client.get(f"/api/scenarios/{sid}").status_code == 404
+
+
+def test_scenario_persists_protected_receiver_bindings(client):
+    payload = {
+        "name": "保护窗场景", "description": "d", "band_low_mhz": 90,
+        "band_high_mhz": 120, "guard_required_mhz": 1.0,
+        "leakage_limit_dbm": -45.0, "reuse_policy": {},
+        "protected_receiver_keys": ["rx-demo-guard"],
+        "carriers": [{"name": "A", "center_mhz": 100, "bandwidth_mhz": 4,
+                      "power_dbm": 10, "polarization": "H", "mask_name": "strict"}],
+    }
+    created = client.post("/api/scenarios", json=payload)
+    assert created.status_code == 200
+    sid = created.json()["id"]
+    loaded = client.get(f"/api/scenarios/{sid}").json()
+    assert loaded["protected_receiver_keys"] == ["rx-demo-guard"]
+    assert loaded["protected_receivers"][0]["receiver_key"] == "rx-demo-guard"
+    assert loaded["protected_receivers"][0]["version"] == 1
 
 
 def test_bad_mask_rejected(client):

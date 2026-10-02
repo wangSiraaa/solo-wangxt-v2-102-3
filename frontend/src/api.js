@@ -23,6 +23,8 @@ export const api = {
   masks: () => request('/masks'),
   listScenarios: () => request('/scenarios'),
   getScenario: (id) => request(`/scenarios/${id}`),
+  listScenarioAnalyses: (id) => request(`/scenarios/${id}/analyses`),
+  listScenarioPlans: (id) => request(`/scenarios/${id}/plans`),
   createScenario: (payload) =>
     request('/scenarios', { method: 'POST', body: JSON.stringify(payload) }),
   updateScenario: (id, payload) =>
@@ -33,4 +35,17 @@ export const api = {
     request('/analyze', { method: 'POST', body: JSON.stringify(payload) }),
   plan: (payload) =>
     request('/plan', { method: 'POST', body: JSON.stringify(payload) }),
+  listReceivers: () => request('/protected-receivers'),
+  listReceiverVersions: (key) =>
+    request(`/protected-receivers/${encodeURIComponent(key)}/versions`),
+  createReceiver: (payload) =>
+    request('/protected-receivers', { method: 'POST', body: JSON.stringify(payload) }),
+  reviseReceiver: (key, payload) =>
+    request(`/protected-receivers/${encodeURIComponent(key)}/revisions`, {
+      method: 'POST', body: JSON.stringify(payload),
+    }),
+  deleteReceiver: (key) =>
+    request(`/protected-receivers/${encodeURIComponent(key)}`, { method: 'DELETE' }),
+  getAnalysis: (id) => request(`/analysis/${id}`),
+  getPlan: (id) => request(`/plans/${id}`),
 }

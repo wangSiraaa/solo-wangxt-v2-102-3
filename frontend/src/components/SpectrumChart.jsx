@@ -4,7 +4,8 @@ import Plot from './Plot.jsx'
 const POL_COLOR = { H: '#4da3ff', V: '#f5a623', LHCP: '#b08cff', RHCP: '#3ecf8e' }
 
 /** 发射谱：各载波掩模曲线（细）+ 线性域功率叠加的聚合谱（粗白）。 */
-export default function SpectrumChart({ spectrum, bands, showCarriers = true }) {
+export default function SpectrumChart({ spectrum, bands, protectedWindows = [],
+                                        showCarriers = true }) {
   const { f_mhz: f, curves = [], aggregate_dbm_hz: agg = [] } = spectrum || {}
 
   const data = useMemo(() => {
@@ -35,11 +36,23 @@ export default function SpectrumChart({ spectrum, bands, showCarriers = true }) 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [spectrum, showCarriers])
 
-  const shapes = useMemo(() => (bands || []).map((b) => ({
-    type: 'rect', x0: b.low_mhz, x1: b.high_mhz, y0: 0, y1: 1, yref: 'paper',
-    fillcolor: POL_COLOR[b.polarization] || '#888',
-    opacity: 0.06, line: { width: 0 },
-  })), [bands])
+  const shapes = useMemo(() => {
+    const out = (bands || []).map((b) => ({
+      type: 'rect', x0: b.low_mhz, x1: b.high_mhz, y0: 0, y1: 1, yref: 'paper',
+      fillcolor: POL_COLOR[b.polarization] || '#888',
+      opacity: 0.06, line: { width: 0 },
+    }))
+    for (const w of protectedWindows) {
+      out.push({
+        type: 'rect', x0: w.window_low_mhz, x1: w.window_high_mhz,
+        y0: 0, y1: 1, yref: 'paper',
+        fillcolor: 'rgba(62,207,142,0.08)', opacity: 1,
+        line: { color: 'rgba(62,207,142,0.85)', width: 1.5, dash: 'dash' },
+        layer: 'below',
+      })
+    }
+    return out
+  }, [bands, protectedWindows])
 
   const layout = {
     height: 340,
@@ -54,5 +67,7 @@ export default function SpectrumChart({ spectrum, bands, showCarriers = true }) 
     hovermode: 'closest',
   }
 
-  return <Plot data={data} layout={layout} revision={JSON.stringify({ n: curves.length, agg: agg.length, show: showCarriers })} />
+  return <Plot data={data} layout={layout} revision={JSON.stringify({ n: curves.length, agg: agg.length,
+                                                                       show: showCarriers,
+                                                                       rx: protectedWindows.length })} />
 }

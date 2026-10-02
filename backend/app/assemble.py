@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from .schemas import AnalyzeRequest, CarrierIn, RulesIn
-from .services.analysis import AnalysisRules, Carrier
+from .schemas import CarrierIn, RulesIn
+from .services.analysis import AnalysisRules, Carrier, ProtectedReceiver
 from .services.masks import MASKS, get_mask, psd_on_grid
 from .services.units import dbm_to_watt
 
@@ -17,11 +17,25 @@ def to_domain(c: CarrierIn, cid: int | None = None) -> Carrier:
     )
 
 
-def to_rules(r: RulesIn) -> AnalysisRules:
+def receiver_to_domain(rx) -> ProtectedReceiver:
+    return ProtectedReceiver(
+        receiver_key=rx.receiver_key,
+        version=rx.version,
+        name=rx.name,
+        window_low_mhz=rx.window_low_mhz,
+        window_high_mhz=rx.window_high_mhz,
+        power_limit_dbm=rx.power_limit_dbm,
+        polarizations=tuple(rx.polarizations),
+        description=getattr(rx, "description", ""),
+    )
+
+
+def to_rules(r: RulesIn, receivers: list[ProtectedReceiver] | None = None) -> AnalysisRules:
     return AnalysisRules(
         guard_required_mhz=r.guard_required_mhz,
         leakage_limit_dbm=r.leakage_limit_dbm,
         reuse_policy=dict(r.reuse_policy),
+        protected_receivers=list(receivers or []),
     )
 
 
@@ -29,6 +43,18 @@ def validate_masks(carriers: list[CarrierIn]) -> None:
     for c in carriers:
         if c.mask_name not in MASKS:
             raise ValueError(f"载波 {c.name!r} 引用了未知掩模 {c.mask_name!r}")
+
+
+def protected_windows_view(receivers: list[ProtectedReceiver]) -> list[dict]:
+    return [{
+        "receiver_key": r.receiver_key,
+        "version": r.version,
+        "name": r.name,
+        "window_low_mhz": r.window_low_mhz,
+        "window_high_mhz": r.window_high_mhz,
+        "power_limit_dbm": r.power_limit_dbm,
+        "polarizations": list(r.polarizations),
+    } for r in receivers]
 
 
 def build_spectrum(carriers: list[Carrier], grid_step_mhz: float) -> dict:

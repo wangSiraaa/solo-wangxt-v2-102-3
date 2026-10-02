@@ -5,7 +5,8 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from .config import DATABASE_URL
-from .db import Base, CarrierRow, MaskRow, Scenario
+from .db import (Base, CarrierRow, MaskRow, ProtectedReceiverRow, Scenario,
+                 ScenarioReceiverLink)
 from .services.masks import MASKS
 
 DEMO_POLICY = {
@@ -50,6 +51,13 @@ DEMO_CARRIERS = [
 ]
 
 
+DEMO_RECEIVERS = [
+    dict(receiver_key="rx-demo-guard", version=1, name="演示保护接收机",
+         window_low_mhz=185.0, window_high_mhz=190.0, power_limit_dbm=-55.0,
+         polarizations=["H", "V"], description="演示固定保护频率窗；默认场景中无载波泄漏。"),
+]
+
+
 def seed(engine) -> None:
     Base.metadata.create_all(engine)
     with Session(engine) as s:
@@ -58,6 +66,12 @@ def seed(engine) -> None:
             if row is None:
                 s.add(MaskRow(name=m.name, points=[list(p) for p in m.points],
                               span_mhz=m.span_mhz, description=m.description))
+
+        for rx in DEMO_RECEIVERS:
+            exists_rx = s.scalar(select(ProtectedReceiverRow).where(
+                ProtectedReceiverRow.receiver_key == rx["receiver_key"]))
+            if exists_rx is None:
+                s.add(ProtectedReceiverRow(**rx, is_current=True, is_deleted=False))
 
         existing = s.scalar(select(Scenario).where(Scenario.name == "教学演示场景"))
         if existing is None:
@@ -68,9 +82,15 @@ def seed(engine) -> None:
                 band_low_mhz=80.0, band_high_mhz=220.0,
                 guard_required_mhz=1.0, leakage_limit_dbm=-45.0,
                 reuse_policy=DEMO_POLICY,
+                receiver_links=[ScenarioReceiverLink(receiver_key="rx-demo-guard")],
             )
             sc.carriers = [CarrierRow(**kw) for kw in DEMO_CARRIERS]
             s.add(sc)
+        elif not any(link.receiver_key == "rx-demo-guard"
+                     for link in existing.receiver_links):
+            # 升级既有教学库：新表创建后为已有演示场景补绑安全保护窗。
+            existing.receiver_links.append(
+                ScenarioReceiverLink(receiver_key="rx-demo-guard"))
         s.commit()
 
 
