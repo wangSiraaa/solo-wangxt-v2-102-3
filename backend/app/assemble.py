@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 
 from .schemas import AnalyzeRequest, CarrierIn, RulesIn
-from .services.analysis import AnalysisRules, Carrier
+from .services.analysis import AnalysisRules, Carrier, ProtectedReceiver
 from .services.masks import MASKS, get_mask, psd_on_grid
 from .services.units import dbm_to_watt
 
@@ -17,11 +17,13 @@ def to_domain(c: CarrierIn, cid: int | None = None) -> Carrier:
     )
 
 
-def to_rules(r: RulesIn) -> AnalysisRules:
+def to_rules(r: RulesIn,
+             receivers: list[ProtectedReceiver] | None = None) -> AnalysisRules:
     return AnalysisRules(
         guard_required_mhz=r.guard_required_mhz,
         leakage_limit_dbm=r.leakage_limit_dbm,
         reuse_policy=dict(r.reuse_policy),
+        receivers=list(receivers or []),
     )
 
 
